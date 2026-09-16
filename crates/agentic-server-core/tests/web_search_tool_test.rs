@@ -4,6 +4,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use agentic_core::config::WebSearchProviderKind;
 use agentic_core::executor::{ConversationHandler, ExecuteRequest, ExecutionContext, ResponseHandler};
 use agentic_core::storage::{ConversationStore, ResponseStore};
 use agentic_core::tool::{GatewayExecutor, ToolOutput, WebSearchHandler};
@@ -13,7 +14,7 @@ use agentic_core::types::io::{
     FunctionToolResultMessage, InputItem, OutputItem, ResponsesInput, ToolCallOutput, ToolChoice,
 };
 use agentic_core::types::request_response::{RequestPayload, ResponseTextConfig};
-use agentic_core::types::tools::{ResponsesTool, WebSearchToolParam};
+use agentic_core::types::tools::{ResponsesTool, WebSearchFilters, WebSearchToolParam};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::routing::{get, post};
@@ -2539,4 +2540,238 @@ async fn stream_returns_incomplete_after_max_gateway_tool_rounds() {
         captured_you.recv().await.expect("mock You.com should receive request");
     }
     assert_eq!(llm.request_bodies().await.len(), 10);
+}
+
+// ---------------------------------------------------------------------------
+// Brave provider
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct CapturedBraveRequest {
+    token: String,
+    body: serde_json::Value,
+}
+
+/// Mock of Brave's `GET /res/v1/web/search` envelope. Returns `retry_after` in
+/// the header on failure so the 429 propagation path can be asserted.
+async fn spawn_mock_brave(
+    status: StatusCode,
+    response_body: serde_json::Value,
+    retry_after: Option<&str>,
+) -> (
+    String,
+    mpsc::Receiver<CapturedBraveRequest>,
+    tokio::task::JoinHandle<()>,
+) {
+    let retry_after = retry_after.map(str::to_owned);
+    let (tx, rx) = mpsc::channel(16);
+    let app = Router::new()
+        .route(
+            "/res/v1/web/search",
+            get(
+                move |State(tx): State<mpsc::Sender<CapturedBraveRequest>>, headers: HeaderMap, uri: Uri| async move {
+                    let token = headers
+                        .get("x-subscription-token")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let body = query_params_as_json(&uri);
+                    tx.send(CapturedBraveRequest { token, body }).await.unwrap();
+                    let json = serde_json::to_string(&response_body).unwrap();
+                    let mut response = axum::response::Response::new(axum::body::Body::from(json));
+                    *response.status_mut() = status;
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+                    if let Some(retry) = retry_after {
+                        response
+                            .headers_mut()
+                            .insert(axum::http::header::RETRY_AFTER, retry.parse().unwrap());
+                    }
+                    response
+                },
+            ),
+        )
+        .with_state(tx);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), rx, handle)
+}
+
+#[tokio::test]
+async fn brave_handler_executes_against_mock_brave_endpoint() {
+    let (base_url, mut captured, _handle) = spawn_mock_brave(
+        StatusCode::OK,
+        serde_json::json!({
+            "web": {"results": [
+                {"title": "Rust", "description": "a", "url": "https://rust.example/rust"}
+            ]},
+            "news": {"results": [
+                {"title": "News", "description": "b", "url": "https://news.example/x"}
+            ]},
+            "query": {"search_term": "rust async"}
+        }),
+        None,
+    )
+    .await;
+    let handler = WebSearchHandler::from_provider(
+        Arc::new(reqwest::Client::new()),
+        WebSearchProviderKind::Brave,
+        Some("secret-brave-key".to_owned()),
+        Some(base_url.clone()),
+        std::num::NonZeroUsize::new(5).unwrap(),
+    );
+    let output = handler
+        .execute(
+            "call_brave",
+            "web_search",
+            r#"{"query":"rust async","count":50}"#,
+            &WebSearchToolParam::default(),
+        )
+        .await
+        .expect("brave search should succeed");
+    let request = captured.recv().await.expect("mock Brave should receive the request");
+    assert_eq!(request.token, "secret-brave-key");
+    // count 50 clamped to Brave's cap of 20.
+    assert_eq!(request.body["count"], 20);
+    assert_eq!(request.body["q"], "rust async");
+    assert_eq!(request.body["result_filter"], "web,news");
+    let parsed: serde_json::Value = serde_json::from_str(&output.output).expect("brave output JSON");
+    assert_eq!(parsed["results"]["web"][0]["url"], "https://rust.example/rust");
+    assert_eq!(parsed["results"]["news"][0]["url"], "https://news.example/x");
+    assert_eq!(parsed["metadata"][0]["query"], "rust async");
+    let _ = base_url;
+}
+
+#[tokio::test]
+async fn brave_handler_surfaces_401_and_429_with_retry_after() {
+    let (base_url, _captured, _handle) = spawn_mock_brave(
+        StatusCode::UNAUTHORIZED,
+        serde_json::json!({"error":"unauthorized"}),
+        None,
+    )
+    .await;
+    let handler = WebSearchHandler::from_provider(
+        Arc::new(reqwest::Client::new()),
+        WebSearchProviderKind::Brave,
+        Some("secret-brave-key".to_owned()),
+        Some(base_url),
+        std::num::NonZeroUsize::new(1).unwrap(),
+    );
+    let err = handler
+        .execute(
+            "call_brave",
+            "web_search",
+            r#"{"query":"rust"}"#,
+            &WebSearchToolParam::default(),
+        )
+        .await
+        .expect_err("401 should fail the call");
+    let message = format!("{err}");
+    assert!(message.contains("401"), "should surface the status: {message}");
+    assert!(
+        !message.contains("secret-brave-key"),
+        "must not leak the secret: {message}"
+    );
+
+    let (base_url, _captured, _handle) =
+        spawn_mock_brave(StatusCode::TOO_MANY_REQUESTS, serde_json::json!({}), Some("30")).await;
+    let handler = WebSearchHandler::from_provider(
+        Arc::new(reqwest::Client::new()),
+        WebSearchProviderKind::Brave,
+        Some("secret-brave-key".to_owned()),
+        Some(base_url),
+        std::num::NonZeroUsize::new(1).unwrap(),
+    );
+    let err = handler
+        .execute(
+            "call_brave",
+            "web_search",
+            r#"{"query":"rust"}"#,
+            &WebSearchToolParam::default(),
+        )
+        .await
+        .expect_err("429 should fail the call");
+    let message = format!("{err}");
+    assert!(message.contains("429"), "should surface the status: {message}");
+    assert!(
+        message.contains("retry after 30s"),
+        "should surface Retry-After: {message}"
+    );
+}
+
+#[tokio::test]
+async fn brave_handler_domain_post_filter_drops_blocklisted_hosts() {
+    let (base_url, _captured, _handle) = spawn_mock_brave(
+        StatusCode::OK,
+        serde_json::json!({
+            "web": {"results": [
+                {"title": "A", "url": "https://docs.example/rust"},
+                {"title": "B", "url": "https://bad.example/rust"}
+            ]},
+            "query": {"search_term": "rust"}
+        }),
+        None,
+    )
+    .await;
+    let handler = WebSearchHandler::from_provider(
+        Arc::new(reqwest::Client::new()),
+        WebSearchProviderKind::Brave,
+        Some("secret-brave-key".to_owned()),
+        Some(base_url),
+        std::num::NonZeroUsize::new(1).unwrap(),
+    );
+    let config = WebSearchToolParam {
+        filters: Some(WebSearchFilters {
+            blocked_domains: Some(vec!["bad.example".to_owned()]),
+            ..Default::default()
+        }),
+        ..WebSearchToolParam::default()
+    };
+    let output = handler
+        .execute("call_brave", "web_search", r#"{"query":"rust"}"#, &config)
+        .await
+        .expect("search should succeed");
+    let parsed: serde_json::Value = serde_json::from_str(&output.output).expect("output JSON");
+    let urls: Vec<&str> = parsed["results"]["web"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        urls,
+        vec!["https://docs.example/rust"],
+        "blocklisted host must be dropped"
+    );
+}
+
+#[tokio::test]
+async fn brave_handler_empty_results_are_graceful() {
+    let (base_url, _captured, _handle) = spawn_mock_brave(
+        StatusCode::OK,
+        serde_json::json!({"web":{"results":[]},"query":{"search_term":"nothing"}}),
+        None,
+    )
+    .await;
+    let handler = WebSearchHandler::from_provider(
+        Arc::new(reqwest::Client::new()),
+        WebSearchProviderKind::Brave,
+        Some("secret-brave-key".to_owned()),
+        Some(base_url),
+        std::num::NonZeroUsize::new(1).unwrap(),
+    );
+    let output = handler
+        .execute(
+            "call_brave",
+            "web_search",
+            r#"{"query":"nothing"}"#,
+            &WebSearchToolParam::default(),
+        )
+        .await
+        .expect("empty results should not fail");
+    let parsed: serde_json::Value = serde_json::from_str(&output.output).expect("output JSON");
+    assert_eq!(parsed["results"]["web"].as_array().unwrap().len(), 0);
 }

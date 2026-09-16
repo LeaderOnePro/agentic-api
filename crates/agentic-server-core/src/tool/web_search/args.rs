@@ -6,6 +6,7 @@
 //! filtering.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 
 use chrono::NaiveDate;
@@ -205,22 +206,19 @@ pub(crate) fn clean_vec(values: Option<&[String]>) -> Option<Vec<String>> {
 }
 
 /// Provider-neutral domain post-filter for providers without server-side
-/// `include_domains` / `exclude_domains` support.
+/// `include_domains` / `exclude_domains` support (e.g. Brave).
 ///
 /// A host matches a domain when it equals the domain or ends with `.{domain}`
 /// (label boundary), compared case-insensitively after IDNA normalization. A
 /// URL without a parseable host cannot be checked, so it is rejected whenever
 /// any allowlist or blocklist is active (fail closed). You.com filters
-/// server-side, so this is not applied on that path; the first provider that
-/// needs it wires it in (#291 Phase 2).
+/// server-side, so this is not applied on that path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(dead_code)] // wired by the first provider without server-side filtering (#291 Phase 2)
 pub(crate) struct DomainFilter {
     include: Vec<String>,
     exclude: Vec<String>,
 }
 
-#[allow(dead_code)] // wired by the first provider without server-side filtering (#291 Phase 2)
 impl DomainFilter {
     pub(crate) fn new(include: Option<&[String]>, exclude: Option<&[String]>) -> Self {
         Self {
@@ -278,9 +276,31 @@ fn host_matches_domain(host: &str, domain: &str) -> bool {
     host == domain || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.'))
 }
 
+/// Caps the requested query concurrency at a provider's own ceiling.
+///
+/// `None` leaves the requested value untouched; otherwise the result is
+/// `min(requested, ceiling)`.
+pub(crate) fn cap_provider_concurrency(ceiling: Option<NonZeroUsize>, requested: NonZeroUsize) -> NonZeroUsize {
+    ceiling.map_or(requested, |cap| requested.min(cap))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_concurrency_cap_bounds_the_request() {
+        let requested = NonZeroUsize::new(5).unwrap();
+        assert_eq!(cap_provider_concurrency(None, requested), requested);
+        assert_eq!(
+            cap_provider_concurrency(Some(NonZeroUsize::new(2).unwrap()), requested),
+            NonZeroUsize::new(2).unwrap()
+        );
+        assert_eq!(
+            cap_provider_concurrency(Some(NonZeroUsize::new(8).unwrap()), requested),
+            requested
+        );
+    }
 
     fn result(url: &str) -> WebSearchResult {
         WebSearchResult {

@@ -7,6 +7,7 @@
 //! as [`you`] shape requests and map responses.
 
 pub(crate) mod args;
+pub(crate) mod brave;
 pub(crate) mod you;
 
 use std::collections::HashMap;
@@ -21,7 +22,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 
-use self::args::{MAX_WEB_SEARCH_QUERIES, WebSearchArguments};
+use self::args::{MAX_WEB_SEARCH_QUERIES, WebSearchArguments, cap_provider_concurrency};
+use self::brave::BraveSearchProvider;
 use self::you::{YOU_API_BASE_URL, YOU_API_KEY, YouSearchProvider};
 use super::handler::MAX_GATEWAY_TOOL_OUTPUT_BYTES;
 use super::handler::{GatewayExecutor, GatewayToolEventPlan, ToolError, ToolHandler, ToolOutput};
@@ -167,26 +169,30 @@ pub struct WebSearchHandler {
 impl WebSearchHandler {
     #[must_use]
     pub fn from_env(client: Arc<reqwest::Client>) -> Self {
-        Self::from_values(
+        Self::from_provider(
             client,
+            WebSearchProviderKind::You,
             std::env::var(YOU_API_KEY).ok(),
             std::env::var(YOU_API_BASE_URL).ok(),
             DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS,
         )
     }
 
-    /// Builds the You.com-backed handler.
-    ///
-    /// `max_concurrent_queries` is the gateway-wide ceiling; the provider's own
-    /// [`WebSearchProvider::max_concurrent_requests`] ceiling caps it again.
+    /// Builds the handler for the given provider from optional credential and
+    /// base URL values; the provider's [`WebSearchProvider::max_concurrent_requests`]
+    /// ceiling further caps `max_concurrent_queries`.
     #[must_use]
-    pub fn from_values(
+    pub fn from_provider(
         client: Arc<reqwest::Client>,
+        provider_kind: WebSearchProviderKind,
         api_key: Option<String>,
         base_url: Option<String>,
         max_concurrent_queries: NonZeroUsize,
     ) -> Self {
-        let provider = Arc::new(YouSearchProvider::from_values(client, api_key, base_url));
+        let provider: Arc<dyn WebSearchProvider> = match provider_kind {
+            WebSearchProviderKind::You => Arc::new(YouSearchProvider::from_values(client, api_key, base_url)),
+            WebSearchProviderKind::Brave => Arc::new(BraveSearchProvider::from_values(client, api_key, base_url)),
+        };
         let effective = effective_query_concurrency(provider.as_ref(), max_concurrent_queries);
         Self::with_provider_and_query_concurrency(provider, effective)
     }
@@ -296,16 +302,11 @@ impl WebSearchHandler {
 
 /// Caps the requested query concurrency at the provider's own ceiling.
 fn effective_query_concurrency(provider: &dyn WebSearchProvider, requested: NonZeroUsize) -> NonZeroUsize {
-    provider
-        .max_concurrent_requests()
-        .map_or(requested, |ceiling| requested.min(ceiling))
+    cap_provider_concurrency(provider.max_concurrent_requests(), requested)
 }
 
-/// A search backend behind `web_search`.
-///
-/// Implementations shape one provider request per query and normalize the
-/// response into [`WebSearchProviderResponse`]; the handler owns fan-out,
-/// concurrency, and the model-facing output shape.
+/// A search backend behind `web_search`: implementations shape one request per
+/// query and normalize the response into [`WebSearchProviderResponse`].
 pub(crate) trait WebSearchProvider: std::fmt::Debug + Send + Sync {
     fn search<'a>(
         &'a self,
@@ -314,8 +315,7 @@ pub(crate) trait WebSearchProvider: std::fmt::Debug + Send + Sync {
         config: &'a WebSearchToolParam,
     ) -> Pin<Box<dyn Future<Output = Result<WebSearchProviderResponse, ToolError>> + Send + 'a>>;
 
-    /// Provider-imposed ceiling on concurrent requests, if any. The handler
-    /// never schedules more queries at once than this allows.
+    /// Provider-imposed ceiling on concurrent requests, if any.
     fn max_concurrent_requests(&self) -> Option<NonZeroUsize> {
         None
     }
@@ -802,8 +802,9 @@ mod tests {
 
     #[test]
     fn from_values_inherits_gateway_concurrency() {
-        let handler = WebSearchHandler::from_values(
+        let handler = WebSearchHandler::from_provider(
             Arc::new(reqwest::Client::new()),
+            WebSearchProviderKind::You,
             None,
             None,
             NonZeroUsize::new(7).expect("nonzero test limit"),
@@ -815,8 +816,9 @@ mod tests {
 
     #[test]
     fn from_values_does_not_leak_api_key_in_debug_output() {
-        let handler = WebSearchHandler::from_values(
+        let handler = WebSearchHandler::from_provider(
             Arc::new(reqwest::Client::new()),
+            WebSearchProviderKind::You,
             Some("super-secret-key".to_owned()),
             Some("https://api.example".to_owned()),
             DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS,

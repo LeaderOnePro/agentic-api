@@ -11,7 +11,8 @@ use agentic_core::config::{
     DEFAULT_POSTGRES_MAX_LIFETIME_SECONDS, DEFAULT_POSTGRES_MIGRATION_TIMEOUT_SECONDS,
     DEFAULT_POSTGRES_STATEMENT_TIMEOUT_SECONDS, DEFAULT_SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
     DEFAULT_SQLITE_MAX_CONNECTIONS, DEFAULT_SQLITE_MMAP_SIZE_BYTES, PostgresConfig, SqliteConfig, SqliteTempStore,
-    ToolRuntimeConfig, WebSearchProviderConfig, default_database_url, ensure_agentic_api_home, normalize_base_url,
+    ToolRuntimeConfig, WebSearchProviderConfig, WebSearchProviderKind, default_database_url, ensure_agentic_api_home,
+    normalize_base_url,
 };
 use agentic_core::error::Error;
 use agentic_server::app::DEFAULT_MAX_REQUEST_BODY_SIZE;
@@ -303,8 +304,16 @@ fn build_config(llm_api_base: String, common: &CommonArgs, file: &FileConfig) ->
         .or_else(|| file.database_url.clone())
         .map_or_else(default_database_url, Ok)?;
     let (postgres, sqlite) = database_configs_from_env(&db_url)?;
+    let web_search_provider_kind = web_search_provider_kind(file)?;
     let web_search_api_key = file.web_search.api_key_env.as_deref().and_then(environment_value);
-    let web_search_base_url = environment_value("YOU_API_BASE_URL").or_else(|| file.web_search.base_url.clone());
+    let web_search_base_url = match web_search_provider_kind {
+        // You.com keeps its historical override name; every other provider
+        // (including Brave) uses the generic `AGENTIC_WEB_SEARCH_BASE_URL`.
+        WebSearchProviderKind::You => {
+            environment_value("YOU_API_BASE_URL").or_else(|| file.web_search.base_url.clone())
+        }
+        _ => environment_value("AGENTIC_WEB_SEARCH_BASE_URL").or_else(|| file.web_search.base_url.clone()),
+    };
     let mcp_allowed_hosts = environment_value("AGENTIC_MCP_ALLOWED_HOSTS")
         .map_or_else(|| file.mcp.allowed_hosts.clone(), |value| parse_comma_separated(&value));
     let max_concurrent_gateway_calls_default = file
@@ -325,13 +334,42 @@ fn build_config(llm_api_base: String, common: &CommonArgs, file: &FileConfig) ->
         postgres,
         sqlite,
         tools: ToolRuntimeConfig {
-            web_search: WebSearchProviderConfig::new(web_search_api_key, web_search_base_url),
+            web_search: WebSearchProviderConfig::new(web_search_provider_kind, web_search_api_key, web_search_base_url),
             mcp_servers: file.mcp_servers.clone(),
             mcp_allowed_hosts,
             messages_gateway_tool_aliases: file.messages_gateway.tool_aliases.clone(),
             max_concurrent_gateway_calls,
         },
     })
+}
+
+/// Resolves the `web_search` provider: the `AGENTIC_WEB_SEARCH_PROVIDER`
+/// environment value overrides the configuration file's `provider` key;
+/// both default to You.com.
+fn web_search_provider_kind(file: &FileConfig) -> Result<WebSearchProviderKind, Error> {
+    resolve_web_search_provider_kind(
+        environment_value("AGENTIC_WEB_SEARCH_PROVIDER"),
+        file.web_search.provider,
+    )
+}
+
+fn resolve_web_search_provider_kind(
+    environment: Option<String>,
+    file_value: Option<WebSearchProviderKind>,
+) -> Result<WebSearchProviderKind, Error> {
+    let parse = |value: &str| -> Result<_, Error> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "you" => Ok(WebSearchProviderKind::You),
+            "brave" => Ok(WebSearchProviderKind::Brave),
+            _ => Err(Error::Config(format!(
+                "invalid AGENTIC_WEB_SEARCH_PROVIDER value '{value}': expected 'you' or 'brave'"
+            ))),
+        }
+    };
+    match environment {
+        Some(value) => parse(&value),
+        None => Ok(file_value.unwrap_or_default()),
+    }
 }
 
 fn gateway_options<'a>(
@@ -356,6 +394,7 @@ fn generated_file_config(llm_api_base: String) -> FileConfig {
         web_search: WebSearchFileConfig {
             base_url: environment_value("YOU_API_BASE_URL"),
             api_key_env: Some("YOU_API_KEY".to_owned()),
+            provider: None,
         },
         mcp: McpFileConfig {
             allowed_hosts: environment_value("AGENTIC_MCP_ALLOWED_HOSTS")
@@ -466,11 +505,14 @@ mod tests {
 
     use clap::{CommandFactory, Parser};
 
+    use super::config_file::{FileConfig, WebSearchFileConfig};
     use super::{
         Cli, Commands, database_configs_from_env, oidc_config_from_values, parse_env_duration_value,
         parse_env_nonzero_usize_value, parse_env_optional_duration_value, parse_env_temp_store_value,
         parse_env_u32_value, parse_env_u64_value, resolve_max_request_body_size_value,
+        resolve_web_search_provider_kind, web_search_provider_kind,
     };
+    use agentic_core::config::WebSearchProviderKind;
     use agentic_core::config::{
         DEFAULT_POSTGRES_ACQUIRE_TIMEOUT_SECONDS, DEFAULT_POSTGRES_IDLE_TIMEOUT_SECONDS,
         DEFAULT_POSTGRES_LOCK_TIMEOUT_SECONDS, DEFAULT_POSTGRES_MAX_CONNECTIONS,
@@ -830,5 +872,62 @@ mod tests {
     fn database_config_rejects_an_invalid_url() {
         let error = database_configs_from_env("not a database URL").expect_err("invalid URL must be rejected");
         assert!(error.to_string().contains("invalid DATABASE_URL"));
+    }
+
+    #[test]
+    fn web_search_provider_defaults_to_you_from_file_config() {
+        let file = FileConfig {
+            web_search: WebSearchFileConfig::default(),
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            web_search_provider_kind(&file).expect("default provider"),
+            WebSearchProviderKind::You
+        );
+
+        let file = FileConfig {
+            web_search: WebSearchFileConfig {
+                provider: Some(WebSearchProviderKind::Brave),
+                ..WebSearchFileConfig::default()
+            },
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            web_search_provider_kind(&file).expect("file provider"),
+            WebSearchProviderKind::Brave
+        );
+    }
+
+    #[test]
+    fn web_search_provider_environment_value_overrides_file_config() {
+        // The environment value wins over the file's provider even when the two
+        // disagree.
+        assert_eq!(
+            resolve_web_search_provider_kind(Some("brave".to_owned()), Some(WebSearchProviderKind::You))
+                .expect("env override"),
+            WebSearchProviderKind::Brave
+        );
+        // Without an environment value the file's provider is used.
+        assert_eq!(
+            resolve_web_search_provider_kind(None, Some(WebSearchProviderKind::Brave)).expect("file provider"),
+            WebSearchProviderKind::Brave
+        );
+        // Neither source set: default to You.
+        assert_eq!(
+            resolve_web_search_provider_kind(None, None).expect("default"),
+            WebSearchProviderKind::You
+        );
+    }
+
+    #[test]
+    fn web_search_provider_rejects_unknown_names() {
+        let error = resolve_web_search_provider_kind(Some("tavily".to_owned()), None)
+            .expect_err("unknown provider must be rejected");
+        assert!(error.to_string().contains("invalid AGENTIC_WEB_SEARCH_PROVIDER"));
+        // Whitespace is trimmed, so ` brave ` is still valid.
+        assert_eq!(
+            resolve_web_search_provider_kind(Some(" brave ".to_owned()), None).expect("trimmed valid value"),
+            WebSearchProviderKind::Brave
+        );
     }
 }

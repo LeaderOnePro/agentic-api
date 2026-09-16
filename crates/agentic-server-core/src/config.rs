@@ -90,15 +90,14 @@ impl Default for SqliteConfig {
 /// Backend that serves the gateway-owned `web_search` tool.
 ///
 /// Additional providers are added here (#291). The enum is non-exhaustive so
-/// downstream crates keep a fallback arm when a new variant lands. Selecting a
-/// provider through [`WebSearchProviderConfig`] is deferred until a second
-/// provider exists.
+/// downstream crates keep a fallback arm when a new variant lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum WebSearchProviderKind {
     #[default]
     You,
+    Brave,
 }
 
 impl WebSearchProviderKind {
@@ -107,6 +106,7 @@ impl WebSearchProviderKind {
     pub const fn default_api_key_env(self) -> &'static str {
         match self {
             Self::You => "YOU_API_KEY",
+            Self::Brave => "BRAVE_API_KEY",
         }
     }
 
@@ -115,6 +115,7 @@ impl WebSearchProviderKind {
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::You => "You.com",
+            Self::Brave => "Brave",
         }
     }
 }
@@ -125,18 +126,27 @@ impl std::fmt::Display for WebSearchProviderKind {
     }
 }
 
-/// Credentials for the gateway-owned `web_search` provider (You.com).
+/// Credentials and selection for the gateway-owned `web_search` provider.
+///
+/// `kind` chooses the backend; the credential and endpoint are resolved per
+/// provider at deployment time.
 #[derive(Clone, Default)]
 pub struct WebSearchProviderConfig {
+    pub kind: WebSearchProviderKind,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
 }
 
 impl WebSearchProviderConfig {
-    /// Builds the config from the credential and endpoint the deployment resolved.
+    /// Builds the config from the selection and credential the deployment
+    /// resolved.
     #[must_use]
-    pub const fn new(api_key: Option<String>, base_url: Option<String>) -> Self {
-        Self { api_key, base_url }
+    pub fn new(kind: WebSearchProviderKind, api_key: Option<String>, base_url: Option<String>) -> Self {
+        Self {
+            kind,
+            api_key,
+            base_url,
+        }
     }
 }
 
@@ -144,6 +154,7 @@ impl std::fmt::Debug for WebSearchProviderConfig {
     /// Redacts `api_key` so debug-printing any enclosing config never logs the secret.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebSearchProviderConfig")
+            .field("kind", &self.kind)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("base_url", &self.base_url)
             .finish()
@@ -300,6 +311,7 @@ mod tests {
     #[test]
     fn web_search_provider_config_debug_redacts_api_key() {
         let config = WebSearchProviderConfig::new(
+            WebSearchProviderKind::You,
             Some("super-secret-key".to_owned()),
             Some("https://api.example".to_owned()),
         );
@@ -315,7 +327,7 @@ mod tests {
         assert!(!format!("{tools:?}").contains("super-secret-key"));
         assert_eq!(
             format!("{:?}", WebSearchProviderConfig::default()),
-            "WebSearchProviderConfig { api_key: None, base_url: None }"
+            "WebSearchProviderConfig { kind: You, api_key: None, base_url: None }"
         );
     }
 
@@ -323,6 +335,8 @@ mod tests {
     fn web_search_provider_kind_labels() {
         assert_eq!(WebSearchProviderKind::You.to_string(), "You.com");
         assert_eq!(WebSearchProviderKind::You.default_api_key_env(), "YOU_API_KEY");
+        assert_eq!(WebSearchProviderKind::Brave.to_string(), "Brave");
+        assert_eq!(WebSearchProviderKind::Brave.default_api_key_env(), "BRAVE_API_KEY");
         assert_eq!(WebSearchProviderKind::default(), WebSearchProviderKind::You);
     }
 

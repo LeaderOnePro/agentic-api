@@ -219,6 +219,9 @@ llm_api_base = "http://127.0.0.1:5050"
 # database_url = "postgresql://agentic-api@localhost/agentic_api"
 
 [web_search]
+# Backend that serves the gateway-owned `web_search` tool: "you" (default) or
+# "brave". Overridden by AGENTIC_WEB_SEARCH_PROVIDER.
+provider = "you"
 base_url = "https://api.ydc-index.io"
 api_key_env = "YOU_API_KEY"
 
@@ -253,8 +256,15 @@ parsed. Order of precedence is `--max-request-body-size-bytes`, then `AGENTIC_MA
 file setting.
 
 `api_key_env` names the process environment variable containing the web-search credential; it does not contain the
-credential itself. `YOU_API_BASE_URL`, `AGENTIC_MCP_ALLOWED_HOSTS`, `AGENTIC_MAX_REQUEST_BODY_SIZE_BYTES`, and
-`AGENTIC_MAX_CONCURRENT_GATEWAY_CALLS` can override their typed file settings. The concurrency value is a sliding-window
+credential itself. `AGENTIC_WEB_SEARCH_PROVIDER`, `AGENTIC_WEB_SEARCH_BASE_URL`,
+`YOU_API_BASE_URL`, `AGENTIC_MCP_ALLOWED_HOSTS`, `AGENTIC_MAX_REQUEST_BODY_SIZE_BYTES`, and
+`AGENTIC_MAX_CONCURRENT_GATEWAY_CALLS` can override their typed file settings.
+`AGENTIC_WEB_SEARCH_BASE_URL` applies to the alternative `brave` provider; You.com
+keeps its historical `YOU_API_BASE_URL` override. The `brave` provider (Brave
+Search API) is the default alternative to You.com: it clamps `count` to its 20-result
+per-section cap, has no server-side domain filtering (domain allow/block lists are
+post-filtered client-side), and runs at most one request in flight to respect the
+free-tier ~1 QPS rate limit. The concurrency value is a sliding-window
 upper bound; handlers may further serialize calls to the same tool name. The MCP allowlist is used only for
 request-declared remote MCP URLs; configured `[mcp_servers]` entries are trusted operator configuration.
 

@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use agentic_core::McpServerEntry;
-use agentic_core::config::CONFIG_FILE_NAME;
+use agentic_core::config::{CONFIG_FILE_NAME, WebSearchProviderKind};
 use agentic_core::error::Error;
 use serde::{Deserialize, Serialize};
 
@@ -15,11 +15,13 @@ pub(crate) struct WebSearchFileConfig {
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<WebSearchProviderKind>,
 }
 
 impl WebSearchFileConfig {
     fn is_empty(&self) -> bool {
-        self.base_url.is_none() && self.api_key_env.is_none()
+        self.base_url.is_none() && self.api_key_env.is_none() && self.provider.is_none()
     }
 }
 
@@ -269,6 +271,7 @@ mod tests {
             web_search: WebSearchFileConfig {
                 base_url: Some("https://api.ydc-index.io".to_owned()),
                 api_key_env: Some("YOU_API_KEY".to_owned()),
+                provider: None,
             },
             mcp: McpFileConfig {
                 allowed_hosts: vec!["mcp.example.com".to_owned()],

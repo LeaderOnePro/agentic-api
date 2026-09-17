@@ -2552,17 +2552,25 @@ struct CapturedBraveRequest {
     body: serde_json::Value,
 }
 
+/// Aborts the mock server task when dropped, so no test leaves a runtime
+/// worker behind.
+struct MockBraveServer {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MockBraveServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Mock of Brave's `GET /res/v1/web/search` envelope. Returns `retry_after` in
 /// the header on failure so the 429 propagation path can be asserted.
 async fn spawn_mock_brave(
     status: StatusCode,
     response_body: serde_json::Value,
     retry_after: Option<&str>,
-) -> (
-    String,
-    mpsc::Receiver<CapturedBraveRequest>,
-    tokio::task::JoinHandle<()>,
-) {
+) -> (String, mpsc::Receiver<CapturedBraveRequest>, MockBraveServer) {
     let retry_after = retry_after.map(str::to_owned);
     let (tx, rx) = mpsc::channel(16);
     let app = Router::new()
@@ -2597,7 +2605,7 @@ async fn spawn_mock_brave(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{addr}"), rx, handle)
+    (format!("http://{addr}"), rx, MockBraveServer { handle })
 }
 
 #[tokio::test]
@@ -2620,7 +2628,7 @@ async fn brave_handler_executes_against_mock_brave_endpoint() {
         Arc::new(reqwest::Client::new()),
         WebSearchProviderKind::Brave,
         Some("secret-brave-key".to_owned()),
-        Some(base_url.clone()),
+        Some(base_url),
         std::num::NonZeroUsize::new(5).unwrap(),
     );
     let output = handler
@@ -2642,7 +2650,6 @@ async fn brave_handler_executes_against_mock_brave_endpoint() {
     assert_eq!(parsed["results"]["web"][0]["url"], "https://rust.example/rust");
     assert_eq!(parsed["results"]["news"][0]["url"], "https://news.example/x");
     assert_eq!(parsed["metadata"][0]["query"], "rust async");
-    let _ = base_url;
 }
 
 #[tokio::test]
@@ -2697,8 +2704,8 @@ async fn brave_handler_surfaces_401_and_429_with_retry_after() {
     let message = format!("{err}");
     assert!(message.contains("429"), "should surface the status: {message}");
     assert!(
-        message.contains("retry after 30s"),
-        "should surface Retry-After: {message}"
+        message.contains("retry after 30"),
+        "should surface Retry-After verbatim: {message}"
     );
 }
 
@@ -2774,4 +2781,68 @@ async fn brave_handler_empty_results_are_graceful() {
         .expect("empty results should not fail");
     let parsed: serde_json::Value = serde_json::from_str(&output.output).expect("output JSON");
     assert_eq!(parsed["results"]["web"].as_array().unwrap().len(), 0);
+}
+
+/// The free-tier ~1 QPS contract: whatever the gateway-wide limit requests, a
+/// Brave-backed handler never has more than one query request in flight. The
+/// mock server counts concurrent in-flight requests and the batched call must
+/// complete only when they were all serialized.
+#[tokio::test]
+async fn brave_provider_caps_effective_query_concurrency_to_one() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default)]
+    struct InFlight {
+        current: Arc<AtomicUsize>,
+        max_seen: Arc<AtomicUsize>,
+    }
+
+    let in_flight = InFlight::default();
+    let max_seen = std::sync::Arc::clone(&in_flight.max_seen);
+    let app = Router::new().route(
+        "/res/v1/web/search",
+        get(move || {
+            let in_flight = in_flight.clone();
+            async move {
+                let active = in_flight.current.fetch_add(1, Ordering::SeqCst) + 1;
+                in_flight.max_seen.fetch_max(active, Ordering::SeqCst);
+                // Hold the request long enough that an unscheduled second query
+                // would overlap with this one.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                in_flight.current.fetch_sub(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({"web": {"results": []}}))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let handler = WebSearchHandler::from_provider(
+        Arc::new(reqwest::Client::new()),
+        WebSearchProviderKind::Brave,
+        Some("secret-brave-key".to_owned()),
+        Some(format!("http://{addr}")),
+        // Gateway-wide ceiling deliberately above the Brave provider's own
+        // ceiling of 1: the effective limit must still be 1.
+        std::num::NonZeroUsize::new(5).unwrap(),
+    );
+    let output = handler
+        .execute(
+            "call_brave",
+            "web_search",
+            r#"{"queries":["a","b","c"]}"#,
+            &WebSearchToolParam::default(),
+        )
+        .await
+        .expect("batched brave search should succeed");
+    let parsed: serde_json::Value = serde_json::from_str(&output.output).expect("output JSON");
+    assert_eq!(parsed["metadata"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "Brave requests must be serialized even with a higher gateway-wide limit"
+    );
+
+    handle.abort();
 }

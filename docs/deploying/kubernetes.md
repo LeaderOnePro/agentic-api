@@ -460,6 +460,32 @@ patches:
 executed by the gateway. Responses API clients declare web search structurally and do not need this alias. Leaving
 the setting empty preserves the default client-owned behavior.
 
+#### Switching the web-search provider to Brave
+
+The gateway supports Brave Search as an alternative `web_search` backend. Set the provider through the ConfigMap and
+put its credential in the same Secret:
+
+```yaml
+patches:
+  - target:
+      kind: ConfigMap
+      name: agentic-api
+    patch: |-
+      - op: add
+        path: /data/AGENTIC_WEB_SEARCH_PROVIDER
+        value: brave
+      # Optional: overrides the Brave API base URL (default
+      # https://api.search.brave.com).
+      - op: add
+        path: /data/AGENTIC_WEB_SEARCH_BASE_URL
+        value: https://api.search.brave.com
+```
+
+The Secret file then contains `BRAVE_API_KEY=...` instead of (or in addition to) `YOU_API_KEY=...`; the provider's
+default credential variable is selected automatically, so no `api_key_env` file setting is needed. Brave clamps
+`count` to 20 results per section, post-filters domain allow/block lists client-side, and runs at most one request in
+flight to respect the free-tier ~1 QPS rate limit.
+
 Apply the overlay, restart the Deployment after every Secret update, and wait for readiness:
 
 ```console

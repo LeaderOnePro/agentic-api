@@ -32,8 +32,10 @@ use crate::tool::handler::ToolError;
 use crate::types::tools::{WebSearchContextSize, WebSearchToolParam};
 
 pub(crate) const BRAVE_API_KEY: &str = WebSearchProviderKind::Brave.default_api_key_env();
-pub(crate) const BRAVE_API_BASE_URL: &str = "BRAVE_API_BASE_URL";
-/// Default Brave Search API base URL used when no base URL is configured.
+/// Default Brave Search API base URL used when no base URL is configured. The
+/// deployment-facing override is `AGENTIC_WEB_SEARCH_BASE_URL`, resolved by the
+/// server binary before a provider is built; unlike You.com, Brave has a
+/// usable default endpoint.
 pub(crate) const BRAVE_DEFAULT_BASE_URL: &str = "https://api.search.brave.com";
 /// Free-tier developer cap on results per section; requested counts above it
 /// are clamped rather than rejected, since the model cannot predict provider
@@ -92,9 +94,9 @@ impl WebSearchProvider for BraveSearchProvider {
                 .api_key
                 .as_ref()
                 .ok_or_else(|| ToolError::Config(format!("{BRAVE_API_KEY} must be set to use the web_search tool")))?;
-            let base_url = self.base_url.as_deref().ok_or_else(|| {
-                ToolError::Config(format!("{BRAVE_API_BASE_URL} must be set to use the web_search tool"))
-            })?;
+            // `from_values` falls back to `BRAVE_DEFAULT_BASE_URL`, so the base
+            // URL is always set for a provider built through the constructor.
+            let base_url = self.base_url.as_deref().unwrap_or(BRAVE_DEFAULT_BASE_URL);
             let request = BraveSearchRequest::from_args_and_config(query, args, config)?;
             let resp = self
                 .client
@@ -117,7 +119,9 @@ impl WebSearchProvider for BraveSearchProvider {
                 let body = read_response_limited(resp, WebSearchProviderKind::Brave)
                     .await
                     .unwrap_or_default();
-                let retry_note = retry_after.map_or_else(String::new, |value| format!(" (retry after {value}s)"));
+                let retry_note = retry_after
+                    .map(|value| format!(" (retry after {value})"))
+                    .unwrap_or_default();
                 return Err(ToolError::Execution(format!(
                     "Brave search returned {status}{retry_note}: {body}"
                 )));
@@ -245,7 +249,15 @@ fn brave_freshness(freshness: &Freshness) -> String {
 /// call: models cannot be expected to know the provider's limit.
 fn clamp_count(count: u16) -> Result<u8, ToolError> {
     let valid = validate_count(count)?;
-    Ok(valid.min(BRAVE_MAX_COUNT))
+    let clamped = valid.min(BRAVE_MAX_COUNT);
+    if clamped != valid {
+        tracing::debug!(
+            requested = valid,
+            clamped,
+            "web_search count clamped to Brave's per-section cap"
+        );
+    }
+    Ok(clamped)
 }
 
 fn clean_base_url(value: &str) -> Option<String> {

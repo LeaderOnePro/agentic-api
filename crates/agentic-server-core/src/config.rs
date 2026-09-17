@@ -94,6 +94,8 @@ impl Default for SqliteConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
+#[derive(strum::EnumIter, strum::VariantNames)]
+#[strum(serialize_all = "snake_case")]
 pub enum WebSearchProviderKind {
     #[default]
     You,
@@ -101,6 +103,36 @@ pub enum WebSearchProviderKind {
 }
 
 impl WebSearchProviderKind {
+    /// Every provider kind's `snake_case` name, in declaration order. Powers
+    /// configuration error messages without duplicating the variant list.
+    pub const VARIANTS: &'static [&'static str] = <Self as strum::VariantNames>::VARIANTS;
+
+    /// Iterates over every provider kind.
+    pub fn variants() -> impl Iterator<Item = Self> {
+        <Self as strum::IntoEnumIterator>::iter()
+    }
+
+    /// Parses a provider name using the same `snake_case` wire names serde
+    /// accepts in configuration files, so environment parsing and file parsing
+    /// share one set of accepted names. Environment values are trimmed and
+    /// case-insensitive, matching operator expectations; the error carries the
+    /// caller's context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::Error::Config`] when `value` (trimmed,
+    /// case-insensitively) is not a `snake_case` name of a known provider
+    /// variant.
+    pub fn parse_name(context: &str, value: &str) -> Result<Self, crate::error::Error> {
+        let normalized = value.trim().to_ascii_lowercase();
+        serde_json::from_value::<Self>(serde_json::Value::String(normalized)).map_err(|_| {
+            crate::error::Error::Config(format!(
+                "invalid {context} value '{value}': expected one of '{}'",
+                Self::VARIANTS.join("', '")
+            ))
+        })
+    }
+
     /// Environment variable that conventionally carries this provider's API key.
     #[must_use]
     pub const fn default_api_key_env(self) -> &'static str {
@@ -338,6 +370,54 @@ mod tests {
         assert_eq!(WebSearchProviderKind::Brave.to_string(), "Brave");
         assert_eq!(WebSearchProviderKind::Brave.default_api_key_env(), "BRAVE_API_KEY");
         assert_eq!(WebSearchProviderKind::default(), WebSearchProviderKind::You);
+    }
+
+    #[test]
+    fn web_search_provider_kind_variants_stay_in_sync() {
+        // strum's variant list and iterator must match serde's accepted wire
+        // names so configuration errors and parsing never drift apart.
+        assert_eq!(WebSearchProviderKind::VARIANTS, ["you", "brave"]);
+        let names: Vec<String> = WebSearchProviderKind::variants().map(|kind| kind.to_string()).collect();
+        assert_eq!(names, ["You.com", "Brave"]);
+        for name in WebSearchProviderKind::VARIANTS {
+            let parsed: WebSearchProviderKind =
+                serde_json::from_value(serde_json::Value::String((*name).to_owned())).expect("serde parses variant");
+            // Round-tripping the strum-derived name through serde proves the
+            // two derive the same set of accepted wire names.
+            let rendered = serde_json::to_value(parsed).expect("serde serializes variant");
+            assert_eq!(rendered, serde_json::Value::String((*name).to_owned()));
+        }
+    }
+
+    #[test]
+    fn web_search_provider_kind_parse_name_is_trimmed_and_case_insensitive() {
+        // Environment values are trimmed and case-insensitive, so common
+        // operator spellings such as `Brave` or ` brave ` are accepted.
+        assert_eq!(
+            WebSearchProviderKind::parse_name("env", "brave").expect("parses"),
+            WebSearchProviderKind::Brave
+        );
+        assert_eq!(
+            WebSearchProviderKind::parse_name("env", "Brave").expect("parses"),
+            WebSearchProviderKind::Brave
+        );
+        assert_eq!(
+            WebSearchProviderKind::parse_name("env", " BRAVE ").expect("parses"),
+            WebSearchProviderKind::Brave
+        );
+        assert_eq!(
+            WebSearchProviderKind::parse_name("env", "you").expect("parses"),
+            WebSearchProviderKind::You
+        );
+
+        // Unknown names are rejected, and the error quotes the original value.
+        let error = WebSearchProviderKind::parse_name("TEST_PROVIDER", "nope").expect_err("rejects unknown");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid TEST_PROVIDER value 'nope': expected one of 'you', 'brave'"),
+            "unexpected error message: {error}"
+        );
     }
 
     #[test]

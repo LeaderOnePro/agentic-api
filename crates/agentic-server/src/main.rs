@@ -305,15 +305,17 @@ fn build_config(llm_api_base: String, common: &CommonArgs, file: &FileConfig) ->
         .map_or_else(default_database_url, Ok)?;
     let (postgres, sqlite) = database_configs_from_env(&db_url)?;
     let web_search_provider_kind = web_search_provider_kind(file)?;
-    let web_search_api_key = file.web_search.api_key_env.as_deref().and_then(environment_value);
+    // Fall back to the selected provider's default credential variable so
+    // switching providers never requires editing the generated config file.
+    let web_search_api_key_env = web_search_api_key_env(file.web_search.api_key_env.clone(), web_search_provider_kind);
+    let web_search_api_key = environment_value(&web_search_api_key_env);
     let web_search_base_url = match web_search_provider_kind {
-        // You.com keeps its historical override name; every other provider
-        // (including Brave) uses the generic `AGENTIC_WEB_SEARCH_BASE_URL`.
-        WebSearchProviderKind::You => {
-            environment_value("YOU_API_BASE_URL").or_else(|| file.web_search.base_url.clone())
-        }
-        _ => environment_value("AGENTIC_WEB_SEARCH_BASE_URL").or_else(|| file.web_search.base_url.clone()),
-    };
+        // You.com keeps its historical override name; other providers
+        // (including Brave) use the generic `AGENTIC_WEB_SEARCH_BASE_URL`.
+        WebSearchProviderKind::You => environment_value("YOU_API_BASE_URL"),
+        _ => environment_value("AGENTIC_WEB_SEARCH_BASE_URL"),
+    }
+    .or_else(|| file.web_search.base_url.clone());
     let mcp_allowed_hosts = environment_value("AGENTIC_MCP_ALLOWED_HOSTS")
         .map_or_else(|| file.mcp.allowed_hosts.clone(), |value| parse_comma_separated(&value));
     let max_concurrent_gateway_calls_default = file
@@ -353,19 +355,17 @@ fn web_search_provider_kind(file: &FileConfig) -> Result<WebSearchProviderKind, 
     )
 }
 
+/// The environment variable holding the web-search credential: the file's
+/// `api_key_env` wins, otherwise the selected provider's default name.
+fn web_search_api_key_env(file_value: Option<String>, kind: WebSearchProviderKind) -> String {
+    file_value.unwrap_or_else(|| kind.default_api_key_env().to_owned())
+}
+
 fn resolve_web_search_provider_kind(
     environment: Option<String>,
     file_value: Option<WebSearchProviderKind>,
 ) -> Result<WebSearchProviderKind, Error> {
-    let parse = |value: &str| -> Result<_, Error> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "you" => Ok(WebSearchProviderKind::You),
-            "brave" => Ok(WebSearchProviderKind::Brave),
-            _ => Err(Error::Config(format!(
-                "invalid AGENTIC_WEB_SEARCH_PROVIDER value '{value}': expected 'you' or 'brave'"
-            ))),
-        }
-    };
+    let parse = |value: &str| WebSearchProviderKind::parse_name("AGENTIC_WEB_SEARCH_PROVIDER", value);
     match environment {
         Some(value) => parse(&value),
         None => Ok(file_value.unwrap_or_default()),
@@ -393,7 +393,7 @@ fn generated_file_config(llm_api_base: String) -> FileConfig {
         llm_api_base: Some(llm_api_base),
         web_search: WebSearchFileConfig {
             base_url: environment_value("YOU_API_BASE_URL"),
-            api_key_env: Some("YOU_API_KEY".to_owned()),
+            api_key_env: None,
             provider: None,
         },
         mcp: McpFileConfig {
@@ -510,7 +510,7 @@ mod tests {
         Cli, Commands, database_configs_from_env, oidc_config_from_values, parse_env_duration_value,
         parse_env_nonzero_usize_value, parse_env_optional_duration_value, parse_env_temp_store_value,
         parse_env_u32_value, parse_env_u64_value, resolve_max_request_body_size_value,
-        resolve_web_search_provider_kind, web_search_provider_kind,
+        resolve_web_search_provider_kind, web_search_api_key_env, web_search_provider_kind,
     };
     use agentic_core::config::WebSearchProviderKind;
     use agentic_core::config::{
@@ -872,6 +872,23 @@ mod tests {
     fn database_config_rejects_an_invalid_url() {
         let error = database_configs_from_env("not a database URL").expect_err("invalid URL must be rejected");
         assert!(error.to_string().contains("invalid DATABASE_URL"));
+    }
+
+    #[test]
+    fn web_search_api_key_env_falls_back_to_provider_default() {
+        // The file's explicit name wins over the provider default.
+        assert_eq!(
+            web_search_api_key_env(Some("CUSTOM_KEY".to_owned()), WebSearchProviderKind::Brave),
+            "CUSTOM_KEY"
+        );
+        // Without a file entry the selected provider's default env name is used,
+        // so `AGENTIC_WEB_SEARCH_PROVIDER=brave` works with only `BRAVE_API_KEY`
+        // set and no hand-edited configuration file.
+        assert_eq!(
+            web_search_api_key_env(None, WebSearchProviderKind::Brave),
+            "BRAVE_API_KEY"
+        );
+        assert_eq!(web_search_api_key_env(None, WebSearchProviderKind::You), "YOU_API_KEY");
     }
 
     #[test]

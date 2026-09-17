@@ -118,6 +118,12 @@ impl WebSearchProviderKind {
     /// case-insensitive, matching operator expectations; the error carries the
     /// caller's context.
     ///
+    /// This deliberately round-trips through serde instead of strum's
+    /// `EnumString`: `FromStr` would derive a parallel name set that only a
+    /// test (not the type system) keeps in sync with serde's, whereas routing
+    /// through serde makes file and environment parsing consistent by
+    /// construction.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::error::Error::Config`] when `value` (trimmed,

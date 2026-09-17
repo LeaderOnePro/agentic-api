@@ -2784,39 +2784,48 @@ async fn brave_handler_empty_results_are_graceful() {
 }
 
 /// The free-tier ~1 QPS contract: whatever the gateway-wide limit requests, a
-/// Brave-backed handler never has more than one query request in flight. The
-/// mock server counts concurrent in-flight requests and the batched call must
-/// complete only when they were all serialized.
+/// Brave-backed handler never has more than one query request in flight, and
+/// every query still reaches the backend exactly once. The mock server counts
+/// concurrent in-flight requests plus total requests, and the batched call
+/// must complete only when the three queries were serialized.
 #[tokio::test]
 async fn brave_provider_caps_effective_query_concurrency_to_one() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone, Default)]
-    struct InFlight {
+    struct Counters {
         current: Arc<AtomicUsize>,
         max_seen: Arc<AtomicUsize>,
+        total: Arc<AtomicUsize>,
     }
 
-    let in_flight = InFlight::default();
-    let max_seen = std::sync::Arc::clone(&in_flight.max_seen);
+    let counters = Counters::default();
+    let max_seen = std::sync::Arc::clone(&counters.max_seen);
+    let total = std::sync::Arc::clone(&counters.total);
     let app = Router::new().route(
         "/res/v1/web/search",
         get(move || {
-            let in_flight = in_flight.clone();
+            let counters = counters.clone();
             async move {
-                let active = in_flight.current.fetch_add(1, Ordering::SeqCst) + 1;
-                in_flight.max_seen.fetch_max(active, Ordering::SeqCst);
+                let active = counters.current.fetch_add(1, Ordering::SeqCst) + 1;
+                counters.max_seen.fetch_max(active, Ordering::SeqCst);
+                counters.total.fetch_add(1, Ordering::SeqCst);
                 // Hold the request long enough that an unscheduled second query
                 // would overlap with this one.
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                in_flight.current.fetch_sub(1, Ordering::SeqCst);
+                counters.current.fetch_sub(1, Ordering::SeqCst);
                 axum::Json(serde_json::json!({"web": {"results": []}}))
             }
         }),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    // RAII guard so a panic between spawn and assertions cannot leak the task.
+    // Kept for its Drop impl; the leading underscore silences the unused warning
+    // while still holding the guard alive until the end of the test.
+    let _server = MockBraveServer {
+        handle: tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+    };
 
     let handler = WebSearchHandler::from_provider(
         Arc::new(reqwest::Client::new()),
@@ -2839,10 +2848,13 @@ async fn brave_provider_caps_effective_query_concurrency_to_one() {
     let parsed: serde_json::Value = serde_json::from_str(&output.output).expect("output JSON");
     assert_eq!(parsed["metadata"].as_array().unwrap().len(), 3);
     assert_eq!(
+        total.load(Ordering::SeqCst),
+        3,
+        "every query must reach the backend exactly once (no silent drops)"
+    );
+    assert_eq!(
         max_seen.load(Ordering::SeqCst),
         1,
         "Brave requests must be serialized even with a higher gateway-wide limit"
     );
-
-    handle.abort();
 }

@@ -36,6 +36,8 @@ serde = { version = "1", features = ["derive"] }
 # Structured Outputs emit object keys in JSON Schema declaration order.
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sse-stream = "0.2.3"
+# Derives only the variant-name list for configuration error messages, keeping
+# it in lockstep with serde's accepted wire names (WebSearchProviderKind::parse_name).
 strum = { version = "0.27", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

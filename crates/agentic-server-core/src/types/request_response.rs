@@ -11,6 +11,9 @@ use super::tools::ResponsesTool;
 use crate::tool::{CodexNamespaceHandler, CustomHandler, ToolError};
 use crate::utils::common::serialize_to_string;
 
+mod serde_helpers;
+use serde_helpers::{default_true, is_absent_or_default_tool_choice, serialize_upstream_tool_choice};
+
 /// Standard Responses API reasoning generation settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -165,6 +168,7 @@ impl utoipa::PartialSchema for RequestPayload {
                 ObjectBuilder::new().schema_type(SchemaType::from_iter([Type::Object, Type::Null])),
             )
             .property("parallel_tool_calls", nullable_bool())
+            .property("prompt_cache_key", nullable_str())
             .property("cache_salt", nullable_str())
             .property(
                 "context_management",
@@ -212,13 +216,11 @@ pub struct RequestPayload<T: ?Sized = ResponseTextConfig> {
     pub metadata: Option<Value>,
     pub parallel_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_salt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Vec<ContextManagement>>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Serialize)]
@@ -228,8 +230,8 @@ pub struct UpstreamRequest<'a> {
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<&'a str>,
-    /// Tools forwarded to vLLM. Function-like declarations are normalized to
-    /// ordinary function tools.
+    /// Tools forwarded to vLLM. Function-like declarations are normalized to ordinary function
+    /// tools.
     /// Skipped when empty so vLLM does not receive an empty array.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<UpstreamTool>>,
@@ -259,6 +261,8 @@ pub struct UpstreamRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_salt: Option<&'a str>,
 }
 
@@ -270,25 +274,6 @@ pub struct UpstreamRequest<'a> {
 #[serde(untagged)]
 pub enum UpstreamTool {
     Function(FunctionTool),
-}
-
-// serde's `skip_serializing_if` requires a `&Option<T>` receiver, so the
-// idiomatic `Option<&T>` clippy suggests does not apply here.
-#[allow(clippy::ref_option)]
-fn is_absent_or_default_tool_choice(choice: &Option<ToolChoice>) -> bool {
-    choice.as_ref().is_none_or(|choice| matches!(choice, ToolChoice::Auto))
-}
-
-// serde's `serialize_with` passes a reference to the field's concrete type.
-#[allow(clippy::ref_option)]
-fn serialize_upstream_tool_choice<S>(choice: &Option<ToolChoice>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    choice
-        .as_ref()
-        .map(ToolChoice::normalized_for_upstream)
-        .serialize(serializer)
 }
 
 impl<T: ?Sized> RequestPayload<T> {
@@ -352,6 +337,7 @@ impl<T: ?Sized> RequestPayload<T> {
             truncation: self.truncation,
             metadata: self.metadata,
             parallel_tool_calls: self.parallel_tool_calls,
+            prompt_cache_key: self.prompt_cache_key,
             cache_salt: self.cache_salt,
             context_management: self.context_management,
         })
@@ -421,6 +407,7 @@ impl RequestPayload {
             truncation: self.truncation.as_deref(),
             metadata: self.metadata.as_ref(),
             parallel_tool_calls,
+            prompt_cache_key: self.prompt_cache_key.as_deref(),
             cache_salt: self.cache_salt.as_deref(),
         })
     }
@@ -662,6 +649,55 @@ mod tests {
             .expect("upstream request should serialize");
 
         assert_eq!(upstream["cache_salt"], "tenant-a");
+    }
+
+    #[test]
+    fn request_payload_omits_absent_and_forwards_present_prompt_cache_key_upstream() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello"
+        }))
+        .expect("request should deserialize");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+        assert!(upstream.get("prompt_cache_key").is_none());
+
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "prompt_cache_key": "workspace-a"
+        }))
+        .expect("request should deserialize");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+        assert_eq!(upstream["prompt_cache_key"], "workspace-a");
+
+        let null_payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "prompt_cache_key": null
+        }))
+        .expect("null should deserialize as an absent key");
+        let upstream = serde_json::to_value(
+            null_payload
+                .to_upstream_request(false)
+                .expect("request should normalize"),
+        )
+        .expect("upstream request should serialize");
+        assert!(upstream.get("prompt_cache_key").is_none());
+
+        for invalid in [
+            serde_json::json!(1),
+            serde_json::json!(true),
+            serde_json::json!({"tenant": "a"}),
+        ] {
+            let result = serde_json::from_value::<RequestPayload>(serde_json::json!({
+                "model": "test-model",
+                "input": "hello",
+                "prompt_cache_key": invalid
+            }));
+            assert!(result.is_err(), "non-string prompt_cache_key must be rejected");
+        }
     }
 
     #[test]

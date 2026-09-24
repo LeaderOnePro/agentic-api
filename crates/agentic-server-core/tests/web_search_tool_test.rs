@@ -1195,7 +1195,11 @@ fn json_object_text_config() -> ResponseTextConfig {
     .unwrap()
 }
 
-fn assert_generation_config_is_preserved(request_bodies: &[serde_json::Value]) {
+fn assert_request_config_is_preserved(request_bodies: &[serde_json::Value]) {
+    assert_eq!(request_bodies[0]["tools"][0]["name"], "web_search");
+    assert_eq!(request_bodies[0]["max_output_tokens"], 1024);
+    assert_eq!(request_bodies[0]["prompt_cache_key"], "workspace-a");
+    assert_eq!(request_bodies[1]["prompt_cache_key"], "workspace-a");
     assert_eq!(request_bodies[0]["reasoning"], serde_json::json!({"effort": "high"}));
     assert_eq!(request_bodies[1]["reasoning"], request_bodies[0]["reasoning"]);
     assert_eq!(
@@ -1237,6 +1241,7 @@ async fn execute_runs_web_search_and_sends_tool_output_back_to_model() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: Some("workspace-a".to_owned()),
         cache_salt: None,
         context_management: None,
     };
@@ -1251,9 +1256,7 @@ async fn execute_runs_web_search_and_sends_tool_output_back_to_model() {
 
     let request_bodies = llm.request_bodies().await;
     assert_eq!(request_bodies.len(), 2);
-    assert_eq!(request_bodies[0]["tools"][0]["name"], "web_search");
-    assert_eq!(request_bodies[0]["max_output_tokens"], 1024);
-    assert_generation_config_is_preserved(&request_bodies);
+    assert_request_config_is_preserved(&request_bodies);
     let second_input = request_bodies[1]["input"]
         .as_array()
         .expect("second request input array");
@@ -1343,6 +1346,7 @@ async fn execute_relaxes_forced_tool_choice_after_web_search_result() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -1378,6 +1382,7 @@ fn base_payload(input: ResponsesInput) -> RequestPayload {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     }
@@ -1513,6 +1518,7 @@ async fn execute_accumulates_usage_across_web_search_model_rounds() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -1561,6 +1567,7 @@ async fn stream_emits_web_search_lifecycle_events_before_final_payload() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -1682,6 +1689,7 @@ async fn multi_round_stream_has_single_lifecycle_and_monotonic_public_sequence()
         max_output_tokens: Some(1024),
         ignore_eos: None,
         truncation: None,
+        prompt_cache_key: Some("workspace-a".to_owned()),
         cache_salt: None,
         metadata: None,
         parallel_tool_calls: None,
@@ -1698,6 +1706,14 @@ async fn multi_round_stream_has_single_lifecycle_and_monotonic_public_sequence()
         .recv()
         .await
         .expect("mock You.com should receive second request");
+
+    let request_bodies = llm.request_bodies().await;
+    assert_eq!(request_bodies.len(), 3);
+    assert!(
+        request_bodies
+            .iter()
+            .all(|body| body["prompt_cache_key"] == "workspace-a")
+    );
 
     let json_events = streamed_sse_events(&chunks);
     assert_single_logical_lifecycle(&json_events);
@@ -1762,6 +1778,7 @@ async fn stream_hides_web_search_function_events_when_name_arrives_on_done() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -1829,6 +1846,7 @@ async fn stream_orders_gateway_lifecycle_before_later_client_function_events() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -1915,6 +1933,7 @@ async fn execute_runs_multiple_web_search_calls_concurrently() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -1968,6 +1987,7 @@ async fn execute_feeds_web_search_execution_errors_back_to_model() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -2023,6 +2043,7 @@ async fn execute_returns_incomplete_after_max_gateway_tool_rounds() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -2078,6 +2099,7 @@ async fn execute_feeds_invalid_web_search_arguments_back_to_model() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -2140,6 +2162,7 @@ async fn execute_runs_large_gateway_fanout_without_hard_cap() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -2292,6 +2315,7 @@ async fn stream_error_events_escape_error_messages() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -2369,6 +2393,7 @@ async fn incomplete_turn_persists_a_consistent_conversation_for_continuation() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -2400,6 +2425,7 @@ async fn incomplete_turn_persists_a_consistent_conversation_for_continuation() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };
@@ -2475,6 +2501,7 @@ async fn stream_returns_incomplete_after_max_gateway_tool_rounds() {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     };

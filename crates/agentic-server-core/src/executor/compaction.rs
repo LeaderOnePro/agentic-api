@@ -334,6 +334,7 @@ fn request_payload(model: String, input: ResponsesInput, instructions: Option<St
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     }
@@ -346,9 +347,8 @@ fn request_payload(model: String, input: ResponsesInput, instructions: Option<St
 /// Returns an invalid-request error for empty input, an upstream error for an unusable model
 /// summary, and propagates inference and serialization failures.
 pub(crate) async fn compact_items(
-    model: &str,
+    request: &RequestPayload,
     input: ResponsesInput,
-    instructions: Option<&str>,
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
 ) -> ExecutorResult<(Vec<InputItem>, ResponseUsage)> {
@@ -370,13 +370,18 @@ pub(crate) async fn compact_items(
         status: None,
         content: InputMessageContent::Text(COMPACTION_PROMPT.to_owned()),
     }));
-    let instructions = instructions.map(str::to_owned);
+    let instructions = request.instructions.clone();
     let original_request = request_payload(
-        model.to_owned(),
+        request.model.clone(),
         ResponsesInput::Items(Vec::new()),
         instructions.clone(),
     );
-    let enriched_request = request_payload(model.to_owned(), ResponsesInput::Items(summary_items), instructions);
+    let mut enriched_request = request_payload(
+        request.model.clone(),
+        ResponsesInput::Items(summary_items),
+        instructions,
+    );
+    enriched_request.prompt_cache_key.clone_from(&request.prompt_cache_key);
     let ctx = RequestContext {
         original_request,
         enriched_request,
@@ -426,15 +431,9 @@ pub(crate) async fn maybe_compact_context(
         return Ok(None);
     }
 
-    tracing::debug!(
-        estimated_tokens,
-        threshold,
-        "automatically compacting resolved response input"
-    );
-    let model = ctx.enriched_request.model.clone();
-    let instructions = ctx.enriched_request.instructions.clone();
+    tracing::debug!(estimated_tokens, threshold, "compacting response input");
     let input = std::mem::replace(&mut ctx.enriched_request.input, ResponsesInput::Items(Vec::new()));
-    let (compacted, usage) = compact_items(&model, input, instructions.as_deref(), exec_ctx, auth).await?;
+    let (compacted, usage) = compact_items(&ctx.enriched_request, input, exec_ctx, auth).await?;
     ctx.enriched_request.input = ResponsesInput::Items(compacted.clone());
     ctx.new_input_items = compacted;
     if let Some(continuation) = &mut ctx.continuation {
@@ -470,10 +469,8 @@ pub async fn compact_response(
     let (mut ctx, tool_search_state) =
         prepare_request_tools(ctx, &exec_ctx.conv_handler, &exec_ctx.resp_handler).await?;
     let tool_search_metadata = tool_search_state.map(ToolSearchState::into_public_metadata);
-    let model = ctx.enriched_request.model.clone();
-    let instructions = ctx.enriched_request.instructions.clone();
     let input = std::mem::replace(&mut ctx.enriched_request.input, ResponsesInput::Items(Vec::new()));
-    let (output, usage) = compact_items(&model, input, instructions.as_deref(), exec_ctx, auth).await?;
+    let (output, usage) = compact_items(&ctx.enriched_request, input, exec_ctx, auth).await?;
 
     let response_id = ctx.response_id.clone();
     ctx.new_input_items.clone_from(&output);
@@ -501,7 +498,7 @@ pub async fn compact_response(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use axum::Router;
     use axum::routing::post;
@@ -591,38 +588,57 @@ mod tests {
         }
     }
 
-    async fn mock_execution_context(response_store: ResponseStore) -> (ExecutionContext, tokio::task::JoinHandle<()>) {
+    fn summary_response() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "created_at": 0,
+            "model": "test-model",
+            "status": "completed",
+            "output": [{
+                "id": "msg_upstream",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": "durable summary",
+                    "annotations": []
+                }]
+            }],
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "total_tokens": 15
+            },
+            "incomplete_details": null,
+            "error": null,
+            "previous_response_id": null,
+            "conversation_id": null,
+            "instructions": null
+        }))
+    }
+
+    async fn mock_execution_context(
+        response_store: ResponseStore,
+    ) -> (
+        ExecutionContext,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new().route(
             "/v1/responses",
-            post(|_body: axum::body::Bytes| async {
-                axum::Json(serde_json::json!({
-                    "id": "resp_upstream",
-                    "object": "response",
-                    "created_at": 0,
-                    "model": "test-model",
-                    "status": "completed",
-                    "output": [{
-                        "id": "msg_upstream",
-                        "type": "message",
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [{
-                            "type": "output_text",
-                            "text": "durable summary",
-                            "annotations": []
-                        }]
-                    }],
-                    "usage": {
-                        "input_tokens": 12,
-                        "output_tokens": 3,
-                        "total_tokens": 15
-                    },
-                    "incomplete_details": null,
-                    "error": null,
-                    "previous_response_id": null,
-                    "conversation_id": null,
-                    "instructions": null
-                }))
+            post({
+                let requests = Arc::clone(&requests);
+                move |body: axum::body::Bytes| {
+                    let requests = Arc::clone(&requests);
+                    async move {
+                        let request = serde_json::from_slice(&body).expect("valid request JSON");
+                        requests.lock().expect("request capture lock").push(request);
+                        summary_response()
+                    }
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -638,7 +654,7 @@ mod tests {
             Arc::new(reqwest::Client::new()),
             format!("http://{address}"),
         );
-        (exec_ctx, server)
+        (exec_ctx, requests, server)
     }
 
     fn compact_request() -> crate::CompactRequest {
@@ -1037,7 +1053,7 @@ mod tests {
         let large_image_input = ResponsesInput::Items(vec![image_message(5 * 1_024 * 1_024)]);
         let image_estimate = estimate_input_tokens(&large_image_input);
         let threshold = image_estimate.saturating_add(100);
-        let (exec_ctx, server) = mock_execution_context(ResponseStore::disabled()).await;
+        let (exec_ctx, requests, server) = mock_execution_context(ResponseStore::disabled()).await;
         let mut image_context = context_with_threshold(large_image_input, threshold);
 
         assert!(
@@ -1060,6 +1076,7 @@ mod tests {
         ]);
         assert!(estimate_input_tokens(&text_input) > threshold);
         let mut text_context = context_with_threshold(text_input, threshold);
+        text_context.enriched_request.prompt_cache_key = Some("workspace-a".to_owned());
 
         assert!(
             maybe_compact_context(&mut text_context, &exec_ctx, None)
@@ -1083,6 +1100,9 @@ mod tests {
             })
         });
         assert_eq!(retained_url, Some(expected_url.as_str()));
+        let requests = requests.lock().expect("request capture lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["prompt_cache_key"], "workspace-a");
         server.abort();
     }
 
@@ -1160,7 +1180,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_storage_does_not_fail_compaction() {
-        let (exec_ctx, server) = mock_execution_context(ResponseStore::disabled()).await;
+        let (exec_ctx, _requests, server) = mock_execution_context(ResponseStore::disabled()).await;
 
         let response = compact_response(compact_request(), &exec_ctx, None)
             .await
@@ -1177,7 +1197,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_context_is_rejected_before_summarization() {
-        let (exec_ctx, server) = mock_execution_context(ResponseStore::disabled()).await;
+        let (exec_ctx, _requests, server) = mock_execution_context(ResponseStore::disabled()).await;
         for input in [
             serde_json::json!(""),
             serde_json::json!([{"role": "user", "content": "   "}]),
@@ -1198,7 +1218,7 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_prepares_tool_search_before_summarization() {
-        let (exec_ctx, server) = mock_execution_context(ResponseStore::disabled()).await;
+        let (exec_ctx, _requests, server) = mock_execution_context(ResponseStore::disabled()).await;
         let request = serde_json::from_value(serde_json::json!({
             "model": "test-model",
             "input": [{
@@ -1234,7 +1254,7 @@ mod tests {
             .await
             .expect("create response store");
         let response_store = ResponseStore::new(pool);
-        let (exec_ctx, server) = mock_execution_context(response_store.clone()).await;
+        let (exec_ctx, _requests, server) = mock_execution_context(response_store.clone()).await;
 
         let response = compact_response(compact_request(), &exec_ctx, None)
             .await
@@ -1272,7 +1292,7 @@ mod tests {
             )
             .await
             .expect("seed previous response");
-        let (exec_ctx, server) = mock_execution_context(response_store.clone()).await;
+        let (exec_ctx, _requests, server) = mock_execution_context(response_store.clone()).await;
         let request = serde_json::from_value(serde_json::json!({
             "model": "test-model",
             "previous_response_id": "resp_previous"

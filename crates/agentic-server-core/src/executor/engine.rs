@@ -470,7 +470,7 @@ async fn run_compaction_trigger(
     let model = ctx.enriched_request.model.clone();
     let instructions = ctx.enriched_request.instructions.clone();
     let input = std::mem::replace(&mut ctx.enriched_request.input, ResponsesInput::Items(Vec::new()));
-    let (mut compacted, usage) = compact_items(&model, input, instructions.as_deref(), exec_ctx, auth).await?;
+    let (mut compacted, usage) = compact_items(&ctx.enriched_request, input, exec_ctx, auth).await?;
     let Some(InputItem::Compaction(compaction)) = compacted.pop() else {
         unreachable!("compact_items always appends a compaction item");
     };

@@ -4,9 +4,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use super::io::{
-    FunctionTool, InputItem, InputMessage, InputMessageContent, OutputItem, ResponseUsage, ResponsesInput, ToolChoice,
-};
+use super::io::{FunctionTool, InputItem, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
 use super::tools::ResponsesTool;
 use crate::tool::{CodexNamespaceHandler, CustomHandler, ToolError};
 use crate::utils::common::serialize_to_string;
@@ -193,6 +191,7 @@ pub struct RequestPayload<T: ?Sized = ResponseTextConfig> {
     pub input: ResponsesInput,
     pub instructions: Option<String>,
     pub previous_response_id: Option<String>,
+    #[serde(alias = "conversation")]
     pub conversation_id: Option<String>,
     pub tools: Option<Vec<ResponsesTool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -517,59 +516,19 @@ impl ResponsePayload {
     }
 }
 
-impl From<&ResponsesInput> for Vec<InputItem> {
-    fn from(input: &ResponsesInput) -> Self {
-        match input {
-            ResponsesInput::Text(text) => vec![InputItem::Message(InputMessage {
-                id: None,
-                role: "user".into(),
-                status: None,
-                content: InputMessageContent::Text(text.clone()),
-            })],
-            ResponsesInput::Items(items) => items
-                .iter()
-                .filter_map(|item| match item {
-                    InputItem::Unknown => None,
-                    InputItem::ShellCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
-                    InputItem::ShellCallOutput(output) => Some(InputItem::FunctionCallOutput(output.clone().into())),
-                    InputItem::CustomToolCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
-                    InputItem::CustomToolCallOutput(output) => {
-                        Some(InputItem::FunctionCallOutput(output.clone().into()))
-                    }
-                    item => Some(item.clone()),
-                })
-                .collect(),
-        }
-    }
-}
-
-impl From<ResponsesInput> for Vec<InputItem> {
-    fn from(input: ResponsesInput) -> Self {
-        match input {
-            ResponsesInput::Text(text) => vec![InputItem::Message(InputMessage {
-                id: None,
-                role: "user".into(),
-                status: None,
-                content: InputMessageContent::Text(text),
-            })],
-            ResponsesInput::Items(items) => items
-                .into_iter()
-                .filter_map(|item| match item {
-                    InputItem::Unknown => None,
-                    InputItem::ShellCall(call) => Some(InputItem::FunctionCall(call.into())),
-                    InputItem::ShellCallOutput(output) => Some(InputItem::FunctionCallOutput(output.into())),
-                    InputItem::CustomToolCall(call) => Some(InputItem::FunctionCall(call.into())),
-                    InputItem::CustomToolCallOutput(output) => Some(InputItem::FunctionCallOutput(output.into())),
-                    item => Some(item),
-                })
-                .collect(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_payload_accepts_openai_conversation_field() {
+        let request: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello", "conversation": "conv_test"
+        }))
+        .expect("OpenAI conversation field should deserialize");
+        assert_eq!(request.conversation_id.as_deref(), Some("conv_test"));
+        assert_eq!(request.in_process_feature(), Some("conversation_id"));
+    }
 
     #[test]
     fn request_payload_preserves_ignore_eos_upstream() {

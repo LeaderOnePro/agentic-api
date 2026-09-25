@@ -201,7 +201,7 @@ async fn assert_relayed_call_id_rejected(
     } else {
         UpstreamBody::Json(relayed)
     };
-    let error = persist(attempt.context, upstream, ctx).await.expect_err(case);
+    let error = Box::pin(persist(attempt.context, upstream, ctx)).await.expect_err(case);
     assert_eq!(status_of(&error), 400, "{case}: {error}");
     let message = error.to_string();
     assert!(
@@ -211,11 +211,11 @@ async fn assert_relayed_call_id_rejected(
     assert!(!message.contains(marker), "{case}: leaked call_id: {message}");
 
     let retry = function_call("fc_retry", "call_retry", "completed");
-    let corrected = persist(
+    let corrected = Box::pin(persist(
         retry_context,
         UpstreamBody::Json(&upstream_call_json(&retry, "completed")),
         ctx,
-    )
+    ))
     .await
     .unwrap_or_else(|error| panic!("{case} consumed {response_id}: {error}"));
     assert_eq!(corrected.id, response_id);

@@ -520,7 +520,7 @@ async fn parent_with_call(exec: &ExecutionContext, session: &ResponseSession) ->
         .unwrap();
     let payload = response(&ctx, json!([function_call("call_first")]));
     let id = ctx.response_id.clone();
-    commit(ctx, payload, exec)
+    Box::pin(commit(ctx, payload, exec))
         .await
         .expect("initial unstored call checkpoint");
     id

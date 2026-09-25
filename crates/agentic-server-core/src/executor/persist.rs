@@ -106,6 +106,9 @@ pub async fn persist_turn(
     persist_prepared_turn(ctx, tool_search_metadata, output_items, conv_handler, resp_handler).await
 }
 
+#[tracing::instrument(name = "agentic.persist", skip_all, fields(
+    agentic.persist.destination = if ctx.original_request.conversation_id.is_some() { "conversation" } else { "response" }
+))]
 pub(crate) async fn persist_prepared_turn(
     mut ctx: RequestContext,
     tool_search_metadata: Option<ToolSearchMetadata>,

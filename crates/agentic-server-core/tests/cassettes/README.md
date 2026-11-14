@@ -1152,7 +1152,7 @@ bytes and boundary.
 | Scenario | Model | What it records |
 |---|---|---|
 | `files-text` | `Qwen/Qwen2.5-3B-Instruct` | upload `notes.txt` (`user_data`), metadata and content retrieval, an `input_file.file_id` answer, a `previous_response_id` continuation, delete, the post-delete continuation and re-reference (`404 not_found`), `notes.txt` as `input_image` (`400`), delete |
-| `files-image` | `Qwen/Qwen2.5-VL-3B-Instruct` | upload `red-blue-64.png` (`vision`), retrieval, an `input_image.file_id` answer (`Red, Blue`), a continuation, delete, the post-delete continuation (`404`), `notes.txt` as `input_image` (`400`), delete |
+| `files-image` | `Qwen/Qwen2.5-VL-3B-Instruct` | upload the `red-blue-64.png` fixture as `colors.png` (`vision`), retrieval, an `input_image.file_id` answer (`Red, Blue`), a continuation, delete, the post-delete continuation (`404`), `notes.txt` as `input_image` (`400`), delete |
 | `files-errors` | `Qwen/Qwen2.5-3B-Instruct` | invalid purpose, missing `file`, missing multipart body, and missing-file metadata, content, and delete (`404`) |
 
 **Recorded configuration.** vLLM 0.33.0 (`vllm/vllm-openai:latest`) serving `Qwen/Qwen2.5-3B-Instruct` for
